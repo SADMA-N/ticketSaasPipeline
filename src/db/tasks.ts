@@ -12,3 +12,9 @@ export async function deleteTask(id: string) {
     where: { id },
   });
 }
+
+export async function getTask(id: string) {
+  return prisma.task.findUnique({
+    where: { id },
+  });
+}

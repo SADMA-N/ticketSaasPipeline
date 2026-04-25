@@ -701,11 +701,13 @@ Files created:
 - `deleteTask` helper already exists for rollback
 - Wire in Epic 2 when queue infrastructure is added
 
-**US-1.2 — GET /tasks/:taskId (TODO)**
+**US-1.2 — GET /tasks/:taskId ✅**
 
-Files to create:
-- `src/controllers/tasksController.ts` — `getTask` handler with `toApiResponse` mapping
-- `src/routes/tasksRouter.ts` — `GET /:taskId` wired to controller
+Files created:
+- `src/db/tasks.ts` — added `getTask` helper ✅
+- `src/controllers/tasksController.ts` — `getTaskStatus` handler, UUID param validation via Zod ✅
+- `src/routes/tasksRouter.ts` — `GET /:taskId` wired to controller ✅
+- `src/app.ts` — mounted at `/tasks`, 4-arg global error handler added ✅
 
 **Key decisions:**
 - Zod validation inline in controller (not separate middleware)
