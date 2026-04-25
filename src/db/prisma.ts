@@ -1,9 +1,9 @@
-import { Pool } from "pg";
+import "dotenv/config";
+
 import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "../generated/prisma/client.js";
-import { config } from "../config/env.js";
+import { PrismaClient } from "../../generated/prisma/client.js";
 
-const pool = new Pool({ connectionString: config.DATABASE_URL });
-const adapter = new PrismaPg(pool);
+const connectionString = process.env.DATABASE_URL;
 
-export const prisma = new PrismaClient({ adapter, log: ["warn", "error"] });
+const adapter = new PrismaPg({ connectionString });
+export const prisma = new PrismaClient({ adapter });
