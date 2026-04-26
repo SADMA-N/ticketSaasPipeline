@@ -1,8 +1,8 @@
 import { Request, Response } from "express";
-import { TicketSchema } from "../schemas/ticket";
-import { createTask } from "../db/tasks";
+import { submitTicket } from "../services/ticketService.js";
+import { TicketSchema } from "../schemas/ticket.js";
 
-export const submitTicket = async (req: Request, res: Response) => {
+export const submitTickets = async (req: Request, res: Response) => {
   // AC4 — validate input
   const { success, data: ticketData, error } = TicketSchema.safeParse(req.body);
   if (!success) {
@@ -13,13 +13,8 @@ export const submitTicket = async (req: Request, res: Response) => {
   }
 
   // AC3 — persist before responding
-  const task = await createTask(ticketData);
+  const taskData = await submitTicket(ticketData);
 
   // AC1 + AC2 — immediate 202
-  return res.status(202).json({
-    task_id: task.id,
-    message: "Ticket received and is being processed.",
-    state: task.state,
-    status_url: `/tasks/${task.id}`,
-  });
+  return res.status(202).json(taskData);
 };

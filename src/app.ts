@@ -2,8 +2,9 @@ import express, { Request, Response } from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
-import ticketRouter from "./routes/ticketsRouter";
-import tasksRouter from "./routes/tasksRouter";
+import ticketsRouter from './routes/ticketsRouter.js';
+import tasksRouter from "./routes/tasksRouter.js";
+
 
 dotenv.config();
 
@@ -14,7 +15,7 @@ app.use(cors());
 app.use(cookieParser());
 app.use(express.json()); // read json from every single req
 
-app.use("/tickets", ticketRouter);
+app.use("/tickets", ticketsRouter);
 app.use("/tasks", tasksRouter);
 
 

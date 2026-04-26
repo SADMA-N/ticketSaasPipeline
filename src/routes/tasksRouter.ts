@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { getTaskStatus } from "../controllers/tasksController";
+import { getTaskStatus } from "../controllers/tasksController.js";
 
 const tasksRouter = Router();
 

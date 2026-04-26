@@ -1,5 +1,5 @@
-import { prisma } from "./prisma";
-import { Ticket } from "../schemas/ticket";
+import { prisma } from "../lib/prisma.js";
+import { Ticket } from "../schemas/ticket.js";
 
 export async function createTask(inputTicket: Ticket) {
   return prisma.task.create({
