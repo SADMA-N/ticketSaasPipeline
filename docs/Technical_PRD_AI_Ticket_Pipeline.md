@@ -58,12 +58,9 @@ This Technical PRD translates the product requirements from `AI_Ticket_Pipeline_
 
 | Layer | Technology | Notes |
 |---|---|---|
-| AI Provider | Anthropic Claude (`claude-3-5-sonnet-20241022`) | Structured output via `tool_use` for schema enforcement |
-| AI SDK | `@anthropic-ai/sdk` | Official Node SDK |
-| AI Observability | **LangSmith** | Trace every LLM call — phase, input, output, latency, token counts |
+| AI Provider | Google Gemini (`gemini-2.0-flash`) | Via Portkey gateway |
+| AI Gateway | **Portkey** (`portkey-ai`) | Routes to Gemini; built-in logs, retries, cost tracking in Portkey dashboard |
 | Schema Validation | Zod | Validates AI JSON output before persisting; parse failures = phase failure |
-
-> **LangSmith Integration:** Wrap every Anthropic call in a LangSmith `traceable()` run. Tag runs with `task_id`, `phase`, and `attempt_number`. This enables per-task trace replay in the LangSmith UI.
 
 ### 1.6 Logging & Observability
 
@@ -71,7 +68,7 @@ This Technical PRD translates the product requirements from `AI_Ticket_Pipeline_
 |---|---|---|
 | Structured Logger | Pino | JSON output, `task_id` bound via child logger for every request |
 | Log Transport (prod) | Pino + stdout → log aggregator (e.g., Logtail, Datadog) | No file logging in containers |
-| Tracing (AI) | LangSmith | AI-specific traces only — not a general APM |
+| Tracing (AI) | Portkey Dashboard | AI-specific traces — request logs, latency, token counts per phase |
 
 ### 1.7 Validation & Config
 
@@ -116,10 +113,8 @@ src/
 ├── phases/
 │   ├── phase1.ts                  # AI triage call + Zod validation
 │   └── phase2.ts                  # AI resolution call + Zod validation
-├── ai/
-│   ├── client.ts                  # Anthropic SDK singleton
-│   ├── prompts.ts                 # Phase 1 + Phase 2 prompt builders
-│   └── langsmith.ts               # LangSmith traceable wrappers
+├── config/
+│   └── portkey.ts                 # Portkey client singleton (gateway to Gemini)
 ├── socket/
 │   └── emitter.ts                 # Socket.io event emitter with typed events
 ├── lib/
@@ -421,34 +416,31 @@ export async function processDLQMessage(taskId: string, errorReason: string) {
 
 ### 6.1 Phase 1 — Ticket Triage
 
-**Anthropic call pattern** (using `tool_use` to enforce structured output):
+**Portkey → Gemini call pattern** (tool calling to enforce structured output):
 
 ```typescript
-// phases/phase1.ts
-import { traceable } from 'langsmith/traceable';
-import { anthropic } from '../ai/client';
+// worker/phase1.ts
+import { portkey } from '../config/portkey';
 import { Phase1OutputSchema } from '../schemas/phase1Output';
 
-export const runPhase1 = traceable(
-  async (inputTicket: unknown): Promise<Phase1Output> => {
-    const response = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 1024,
-      tools: [{ name: 'triage_ticket', description: '...', input_schema: phase1JsonSchema }],
-      tool_choice: { type: 'tool', name: 'triage_ticket' },
-      messages: [{ role: 'user', content: buildPhase1Prompt(inputTicket) }],
-    });
+export async function runPhase1(inputTicket: unknown): Promise<Phase1Output> {
+  const ticket = inputTicket as Ticket;
 
-    const toolUse = response.content.find(b => b.type === 'tool_use');
-    if (!toolUse) throw new Error('No tool_use block in Phase 1 response');
+  const response = await portkey.chat.completions.create({
+    model: 'gemini-2.0-flash',
+    messages: [{ role: 'user', content: `Classify this support ticket:\n\nSubject: ${ticket.subject}\nBody: ${ticket.body}` }],
+    tools: [{ type: 'function', function: { name: 'classify_ticket', parameters: phase1JsonSchema } }],
+    tool_choice: { type: 'function', function: { name: 'classify_ticket' } },
+  });
 
-    const parsed = Phase1OutputSchema.safeParse(toolUse.input);
-    if (!parsed.success) throw new Error(`Phase 1 output invalid: ${parsed.error.message}`);
+  const toolCall = response.choices[0].message.tool_calls?.[0];
+  if (!toolCall) throw new Error('No tool call in Phase 1 response');
 
-    return parsed.data;
-  },
-  { name: 'phase1_triage', metadata: { phase: 'phase_1' } }
-);
+  const parsed = Phase1OutputSchema.safeParse(JSON.parse(toolCall.function.arguments));
+  if (!parsed.success) throw new Error(`Phase 1 output invalid: ${parsed.error.message}`);
+
+  return parsed.data;
+}
 ```
 
 **Phase 1 Zod Output Schema:**
@@ -468,27 +460,23 @@ export type Phase1Output = z.infer<typeof Phase1OutputSchema>;
 ### 6.2 Phase 2 — Resolution Draft
 
 ```typescript
-// phases/phase2.ts
-export const runPhase2 = traceable(
-  async (inputTicket: unknown, phase1Output: Phase1Output): Promise<Phase2Output> => {
-    const response = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 2048,
-      tools: [{ name: 'draft_resolution', description: '...', input_schema: phase2JsonSchema }],
-      tool_choice: { type: 'tool', name: 'draft_resolution' },
-      messages: [{ role: 'user', content: buildPhase2Prompt(inputTicket, phase1Output) }],
-    });
+// worker/phase2.ts
+export async function runPhase2(inputTicket: unknown, phase1Output: Phase1Output): Promise<Phase2Output> {
+  const response = await portkey.chat.completions.create({
+    model: 'gemini-2.0-flash',
+    messages: [{ role: 'user', content: buildPhase2Prompt(inputTicket, phase1Output) }],
+    tools: [{ type: 'function', function: { name: 'draft_resolution', parameters: phase2JsonSchema } }],
+    tool_choice: { type: 'function', function: { name: 'draft_resolution' } },
+  });
 
-    const toolUse = response.content.find(b => b.type === 'tool_use');
-    if (!toolUse) throw new Error('No tool_use block in Phase 2 response');
+  const toolCall = response.choices[0].message.tool_calls?.[0];
+  if (!toolCall) throw new Error('No tool call in Phase 2 response');
 
-    const parsed = Phase2OutputSchema.safeParse(toolUse.input);
-    if (!parsed.success) throw new Error(`Phase 2 output invalid: ${parsed.error.message}`);
+  const parsed = Phase2OutputSchema.safeParse(JSON.parse(toolCall.function.arguments));
+  if (!parsed.success) throw new Error(`Phase 2 output invalid: ${parsed.error.message}`);
 
-    return parsed.data;
-  },
-  { name: 'phase2_resolution', metadata: { phase: 'phase_2' } }
-);
+  return parsed.data;
+}
 ```
 
 **Phase 2 Zod Output Schema:**
@@ -643,14 +631,9 @@ AWS_REGION=us-east-1
 AWS_ACCESS_KEY_ID=test
 AWS_SECRET_ACCESS_KEY=test
 
-# Anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-
-# LangSmith
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
-LANGCHAIN_API_KEY=ls__...
-LANGCHAIN_PROJECT=ai-ticket-pipeline
+# Portkey (AI Gateway → Gemini)
+PORTKEY_API_KEY=pk-...
+PORTKEY_VIRTUAL_KEY=your-gemini-virtual-key
 ```
 
 All variables are validated at startup via Zod:
@@ -665,7 +648,8 @@ const EnvSchema = z.object({
   AWS_REGION: z.string().default('us-east-1'),
   AWS_ACCESS_KEY_ID: z.string(),
   AWS_SECRET_ACCESS_KEY: z.string(),
-  ANTHROPIC_API_KEY: z.string(),
+  PORTKEY_API_KEY: z.string(),
+  PORTKEY_VIRTUAL_KEY: z.string(),
 });
 export const config = EnvSchema.parse(process.env);  // throws on startup if invalid
 ```
@@ -735,17 +719,15 @@ Files created:
 ### Epic 3 — AI Triage Pipeline (Phase 1)
 
 **Files to create:**
-- `src/ai/client.ts` — Anthropic SDK singleton
-- `src/ai/prompts.ts` — `buildPhase1Prompt(ticket): string`
-- `src/phases/phase1.ts` — `runPhase1()` with LangSmith wrapper
-- `src/schemas/phase1Output.ts` — Zod schema + TypeScript type
+- `src/config/portkey.ts` — Portkey client singleton (gateway to Gemini)
+- `src/worker/phase1.ts` — `runPhase1()` with Portkey tool calling + Zod validation
 
 **Prompt design:**
-- Use `tool_use` with `tool_choice: { type: "tool", name: "triage_ticket" }` to force structured output — no regex parsing of freeform text.
-- Prompt includes: ticket subject, body, and customer metadata.
-- The JSON schema for the tool input maps directly to `Phase1OutputSchema`.
+- Use Portkey's OpenAI-compatible tool calling with `tool_choice: { type: "function", name: "classify_ticket" }` to force structured output — no regex parsing of freeform text.
+- Prompt includes: ticket subject and body.
+- The function parameters schema maps directly to `Phase1OutputSchema`.
 
-**Validation rule:** If `Phase1OutputSchema.safeParse(toolInput)` fails, throw an error — this triggers BullMQ retry and increments `phase1Retries`.
+**Validation rule:** If `Phase1OutputSchema.safeParse()` fails, throw an error — this triggers SQS retry and increments `phase1Retries`.
 
 ---
 

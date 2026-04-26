@@ -9,6 +9,8 @@ const EnvSchema = z.object({
   AWS_REGION: z.string().default("us-east-1"),
   AWS_ACCESS_KEY_ID: z.string(),
   AWS_SECRET_ACCESS_KEY: z.string(),
+  PORTKEY_API_KEY: z.string(),
+  PORTKEY_CONFIG_ID: z.string(),
 });
 
 export const config = EnvSchema.parse(process.env);
