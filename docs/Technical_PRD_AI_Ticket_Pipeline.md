@@ -41,11 +41,11 @@ This Technical PRD translates the product requirements from `AI_Ticket_Pipeline_
 
 | Layer | Technology | Notes |
 |---|---|---|
-| Queue | BullMQ | Redis-backed, supports per-job retry config, DLQ pattern via `failed` event listener |
-| Cache / Queue Broker | Redis 7 (via Upstash or self-hosted) | BullMQ requires Redis; also used for idempotency locks |
-| Worker | BullMQ `Worker` class | Separate worker process from the API server |
+| Queue | AWS SQS (`@aws-sdk/client-sqs`) | Managed queue; SDK already installed; same code works against real AWS in prod |
+| Local Dev Broker | LocalStack (Docker, port 4566) | Emulates SQS locally — same Docker pattern as Postgres |
+| Worker | Custom Node.js polling loop | Separate process from the API server; long-polls SQS (20s wait) |
 
-> **DLQ Pattern with BullMQ:** BullMQ does not have a native DLQ concept. Jobs that exhaust `attempts` are moved to a "failed" state in Redis. A dedicated `queue.on('failed')` listener handles DLQ logic — it reads the current task's `phase_checkpoints` from the DB and transitions state to `completed_with_fallback` or `needs_manual_review`. This listener acts as the DLQ handler.
+> **DLQ Pattern with SQS:** Configure a Dead Letter Queue on the main SQS queue with `maxReceiveCount: 3`. After 3 failed visibility-timeout cycles, SQS automatically moves the message to the DLQ. A dedicated DLQ listener polls the DLQ and transitions task state to `completed_with_fallback` or `needs_manual_review` based on `phase1Done` checkpoint in Postgres.
 
 ### 1.4 Real-Time
 
@@ -84,7 +84,7 @@ This Technical PRD translates the product requirements from `AI_Ticket_Pipeline_
 
 | Tool | Purpose |
 |---|---|
-| Docker + docker-compose | Local Postgres + Redis in one command |
+| Docker + docker-compose | Local Postgres + LocalStack (SQS) in one command |
 | ESLint + Prettier | Code style, enforced in CI |
 | Vitest | Unit and integration tests |
 | Supertest | HTTP endpoint integration tests |
@@ -93,49 +93,54 @@ This Technical PRD translates the product requirements from `AI_Ticket_Pipeline_
 
 ## 2. Project Structure
 
-> **Implementation note:** Actual structure uses `app.ts → routes/ → controllers/` pattern (standard MVC) instead of the `api/` nested layout below. `src/api/` is not used.
+> **Implementation note:** Actual structure uses layered MVC — `app.ts → routes/ → controllers/ → services/ → repositories/`. No `src/api/` or `src/db/` directories.
 
 ```
 src/
-├── app.ts                      # Express bootstrap, route mounting, error handlers
+├── app.ts                         # Express bootstrap, route mounting, error handlers
 ├── routes/
-│   ├── ticketsRouter.ts        # POST /tickets
-│   └── tasksRouter.ts          # GET /tasks/:taskId
+│   ├── ticketsRouter.ts           # POST /tickets
+│   └── tasksRouter.ts             # GET /tasks/:taskId
 ├── controllers/
-│   ├── ticketsController.ts    # submitTicket handler
-│   └── tasksController.ts      # getTask handler
+│   ├── ticketsController.ts       # submitTickets handler (Zod validate → service)
+│   └── tasksController.ts         # getTaskStatus handler (Zod validate → service)
+├── services/
+│   ├── ticketService.ts           # submitTicket() — createTask + SQS enqueue
+│   └── taskService.ts             # getTaskById() — fetch + buildOutputs + buildFallbackInfo
+├── repositories/
+│   └── taskRepositories.ts        # createTask, deleteTask, getTask, updateTask (Prisma)
 ├── worker/
-│   ├── queue.ts                # BullMQ queue + DLQ listener
-│   ├── processor.ts            # Job processor — orchestrates phases
-│   └── worker.ts               # Worker entrypoint (separate process)
+│   ├── queue.ts                   # sendMessage, receiveMessage, deleteMessage (SQS helpers)
+│   ├── processor.ts               # processJob() — phase orchestration + state updates
+│   └── worker.ts                  # Polling loop entrypoint (separate process)
 ├── phases/
-│   ├── phase1.ts               # AI triage call + Zod validation
-│   └── phase2.ts               # AI resolution call + Zod validation
+│   ├── phase1.ts                  # AI triage call + Zod validation
+│   └── phase2.ts                  # AI resolution call + Zod validation
 ├── ai/
-│   ├── client.ts               # Anthropic SDK singleton
-│   ├── prompts.ts              # Phase 1 + Phase 2 prompt builders
-│   └── langsmith.ts            # LangSmith traceable wrappers
+│   ├── client.ts                  # Anthropic SDK singleton
+│   ├── prompts.ts                 # Phase 1 + Phase 2 prompt builders
+│   └── langsmith.ts               # LangSmith traceable wrappers
 ├── socket/
-│   └── emitter.ts              # Socket.io event emitter with typed events
-├── db/
-│   ├── prisma.ts               # PrismaClient singleton
-│   └── tasks.ts                # Task DB helpers (create, update, getById)
+│   └── emitter.ts                 # Socket.io event emitter with typed events
+├── lib/
+│   └── prisma.ts                  # PrismaClient singleton
 ├── schemas/
-│   ├── ticket.ts               # Inbound ticket Zod schema
-│   ├── phase1Output.ts         # Phase 1 AI output Zod schema
-│   └── phase2Output.ts         # Phase 2 AI output Zod schema
+│   ├── ticket.ts                  # Inbound ticket Zod schema
+│   ├── phase1Output.ts            # Phase 1 AI output Zod schema
+│   └── phase2Output.ts            # Phase 2 AI output Zod schema
 ├── config/
-│   └── env.ts                  # Env var schema + parsed config object
+│   ├── env.ts                     # Zod env schema + parsed config object
+│   └── sqs.ts                     # SQS client singleton (LocalStack in dev)
 ├── types/
-│   └── index.ts                # Shared TypeScript types (TaskState, SocketEvent, etc.)
-└── logger.ts                   # Pino logger singleton
+│   └── index.ts                   # Shared TypeScript types
+└── logger.ts                      # Pino logger singleton
 
 prisma/
 ├── schema.prisma
 └── migrations/
 
 docker-compose.yml
-.env.example
+.env
 ```
 
 ---
@@ -315,114 +320,99 @@ function buildOutputs(task: Task) {
 
 ## 5. Queue & Worker Architecture
 
-### 5.1 Queue Configuration (BullMQ)
+### 5.1 Queue Configuration (SQS)
 
 ```typescript
-// worker/queue.ts
-import { Queue, Worker, QueueEvents } from 'bullmq';
-import { redis } from '../config/redis';
+// config/sqs.ts
+import { SQSClient } from '@aws-sdk/client-sqs';
+import { config } from './env.js';
 
-export const ticketQueue = new Queue('ticket-processing', {
-  connection: redis,
-  defaultJobOptions: {
-    attempts: 3,                       // max 3 total attempts per job
-    backoff: { type: 'exponential', delay: 2000 }, // 2s, 4s, 8s
-    removeOnComplete: { count: 100 },  // keep last 100 completed jobs
-    removeOnFail: false,               // keep failed jobs for inspection
+export const sqsClient = new SQSClient({
+  region: config.AWS_REGION,
+  endpoint: config.SQS_ENDPOINT,   // http://localhost:4566 in dev (LocalStack)
+  credentials: {
+    accessKeyId: config.AWS_ACCESS_KEY_ID,
+    secretAccessKey: config.AWS_SECRET_ACCESS_KEY,
   },
 });
 ```
 
-> **Phase-level retry vs job-level retry:** BullMQ retries operate at the job level. Phase-level idempotency is achieved via the `phase1Done` / `phase2Done` checkpoints stored in the DB. When a job is retried (re-enqueued), the worker reads these flags and skips the already-completed phase. This means retry count in BullMQ ≠ phase retry count — the DB is the source of truth for per-phase retry counts, incremented manually by the worker before each attempt.
+> **Phase-level retry vs SQS retry:** SQS retries operate via visibility timeout — if the worker throws without calling `deleteMessage`, the message becomes visible again after the timeout expires. Phase-level idempotency is achieved via `phase1Done` / `phase2Done` checkpoints in Postgres. On retry, the worker reads these flags and skips already-completed phases. Per-phase retry counts (`phase1Retries`, `phase2Retries`) are incremented manually in Postgres before each attempt — not derived from SQS.
 
 ### 5.2 Worker Flow
 
 ```typescript
-// worker/processor.ts
-const worker = new Worker('ticket-processing', async (job) => {
-  const { taskId } = job.data;
-  const task = await prisma.task.findUniqueOrThrow({ where: { id: taskId } });
+// worker/worker.ts — polling loop
+import { receiveMessages, deleteMessage } from './queue.js';
+import { processJob } from './processor.js';
+
+async function poll() {
+  while (true) {
+    const messages = await receiveMessages();   // long-poll, 20s wait
+    for (const msg of messages) {
+      const { taskId } = JSON.parse(msg.Body!);
+      try {
+        await processJob(taskId);
+        await deleteMessage(msg.ReceiptHandle!); // only on success
+      } catch (err) {
+        // do NOT deleteMessage — visibility timeout → SQS auto-retries
+      }
+    }
+  }
+}
+poll();
+
+// worker/processor.ts — phase orchestration
+export async function processJob(taskId: string) {
+  const task = await getTask(taskId);
 
   // Idempotency guard — discard if already terminal
   const TERMINAL = ['completed', 'completed_with_fallback', 'needs_manual_review'];
-  if (TERMINAL.includes(task.state)) {
-    logger.info({ taskId, event: 'duplicate_job_discarded' });
-    return;
-  }
+  if (TERMINAL.includes(task.state)) return;
 
-  await updateTask(taskId, { state: 'processing' });
-  emitSocketEvent(taskId, 'started');
+  await updateTask(taskId, { state: 'processing', currentPhase: 'phase_1' });
 
   // ── Phase 1 ──────────────────────────────────────
   if (!task.phase1Done) {
-    emitSocketEvent(taskId, 'phase_1_started');
-    await updateTask(taskId, { currentPhase: 'phase_1' });
-    await incrementRetry(taskId, 'phase_1');
-
-    const phase1Result = await runPhase1(task.inputTicket);   // throws on failure
-    await updateTask(taskId, {
-      phase1Output: phase1Result,
-      phase1Done: true,
-      currentPhase: 'phase_2',
-    });
-    emitSocketEvent(taskId, 'phase_1_complete', { output: phase1Result });
+    await updateTask(taskId, { phase1Retries: { increment: 1 } });
+    const phase1Result = await runPhase1(task.inputTicket);  // throws on failure
+    await updateTask(taskId, { phase1Output: phase1Result, phase1Done: true, currentPhase: 'phase_2' });
   }
 
   // ── Phase 2 ──────────────────────────────────────
-  const freshTask = await getTask(taskId);  // re-fetch to get phase1Output
+  const freshTask = await getTask(taskId);
   if (!freshTask.phase2Done) {
-    emitSocketEvent(taskId, 'phase_2_started');
-    await incrementRetry(taskId, 'phase_2');
-
+    await updateTask(taskId, { phase2Retries: { increment: 1 } });
     const phase2Result = await runPhase2(freshTask.inputTicket, freshTask.phase1Output);
     await updateTask(taskId, {
-      phase2Output: phase2Result,
-      phase2Done: true,
-      state: 'completed',
-      currentPhase: null,
-      stateChangedAt: new Date(),
+      phase2Output: phase2Result, phase2Done: true,
+      state: 'completed', currentPhase: null, stateChangedAt: new Date(),
     });
-    emitSocketEvent(taskId, 'phase_2_complete');
-    emitSocketEvent(taskId, 'completed');
   }
-
-}, { connection: redis, concurrency: 5 });
+}
 ```
 
-### 5.3 DLQ Handler (Failed Job Listener)
+### 5.3 DLQ Handler
 
 ```typescript
-// worker/queue.ts (continued)
-worker.on('failed', async (job, err) => {
-  if (!job || job.attemptsMade < job.opts.attempts!) return; // still has retries
-
-  const { taskId } = job.data;
+// worker/dlqWorker.ts — polls Dead Letter Queue
+export async function processDLQMessage(taskId: string, errorReason: string) {
   const task = await getTask(taskId);
 
   if (!task.phase1Done) {
     // Phase 1 never succeeded → needs_manual_review
     await updateTask(taskId, {
-      state: 'needs_manual_review',
-      currentPhase: null,
-      fallbackReason: err.message,
-      fallbackAt: new Date(),
-      stateChangedAt: new Date(),
+      state: 'needs_manual_review', currentPhase: null,
+      fallbackReason: errorReason, fallbackAt: new Date(), stateChangedAt: new Date(),
     });
-    emitSocketEvent(taskId, 'needs_manual_review', { reason: err.message });
-    logger.warn({ taskId, event: 'needs_manual_review', reason: err.message });
   } else {
-    // Phase 1 succeeded, Phase 2 failed → completed_with_fallback
+    // Phase 1 ok, Phase 2 failed → completed_with_fallback
     await updateTask(taskId, {
-      state: 'completed_with_fallback',
-      currentPhase: null,
-      fallbackReason: err.message,
-      fallbackAt: new Date(),
-      stateChangedAt: new Date(),
+      state: 'completed_with_fallback', currentPhase: null,
+      fallbackReason: errorReason, fallbackAt: new Date(), stateChangedAt: new Date(),
     });
-    emitSocketEvent(taskId, 'completed_with_fallback', { reason: err.message });
-    logger.warn({ taskId, event: 'completed_with_fallback', reason: err.message });
   }
-});
+}
 ```
 
 ---
@@ -624,28 +614,34 @@ jobLogger.info({ event: 'completed', outcome: 'completed', duration_ms: totalEla
 
 Two layers protect against duplicate processing:
 
-1. **BullMQ `jobId`** — `queue.add('process', data, { jobId: taskId })`. BullMQ deduplicates by `jobId`; adding the same `jobId` twice is a no-op if the job is still active or waiting.
+1. **SQS message deduplication** — SQS standard queues can deliver a message more than once (at-least-once delivery). The worker-level guard (below) handles this.
 
-2. **Worker terminal-state guard** — On job pickup, the worker reads the task's `state` from the DB. If it is already in a terminal state (`completed`, `completed_with_fallback`, `needs_manual_review`), the job is discarded immediately without touching any outputs or emitting any socket events.
+2. **Worker terminal-state guard** — On job pickup, the worker reads the task's `state` from Postgres. If already in a terminal state (`completed`, `completed_with_fallback`, `needs_manual_review`), the job is discarded immediately — `deleteMessage` is called and the worker returns without touching outputs.
 
-This combination handles both the queue-level duplicate delivery and the race condition where a job is retried after the state has already been written as terminal by a parallel worker.
+3. **Phase checkpoints** — `phase1Done` / `phase2Done` flags in Postgres ensure a retry never re-runs a phase that already succeeded. The worker checks these flags before running each phase.
+
+This combination handles duplicate SQS delivery and the crash-recovery case where the worker is restarted mid-job.
 
 ---
 
 ## 10. Environment Variables
 
 ```bash
-# .env.example
+# .env
 
 # App
 NODE_ENV=development
 PORT=3000
 
 # Database
-DATABASE_URL=postgresql://user:pass@localhost:5432/ticket_pipeline
+DATABASE_URL=postgresql://postgres:testingpassword@localhost:5432/ticket_pipeline
 
-# Redis
-REDIS_URL=redis://localhost:6379
+# SQS (LocalStack in dev)
+SQS_QUEUE_URL=http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/ticket-queue
+SQS_ENDPOINT=http://localhost:4566
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=test
+AWS_SECRET_ACCESS_KEY=test
 
 # Anthropic
 ANTHROPIC_API_KEY=sk-ant-...
@@ -655,25 +651,21 @@ LANGCHAIN_TRACING_V2=true
 LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
 LANGCHAIN_API_KEY=ls__...
 LANGCHAIN_PROJECT=ai-ticket-pipeline
-
-# Queue config
-QUEUE_MAX_ATTEMPTS=3
-QUEUE_BACKOFF_MS=2000
-
-# Worker
-WORKER_CONCURRENCY=5
 ```
 
 All variables are validated at startup via Zod:
 ```typescript
 // config/env.ts
 const EnvSchema = z.object({
-  DATABASE_URL: z.string().url(),
-  REDIS_URL: z.string().url(),
-  ANTHROPIC_API_KEY: z.string().startsWith('sk-ant-'),
-  LANGCHAIN_API_KEY: z.string(),
-  QUEUE_MAX_ATTEMPTS: z.coerce.number().default(3),
-  // ...
+  NODE_ENV: z.string().default('development'),
+  PORT: z.coerce.number().default(3000),
+  DATABASE_URL: z.url(),
+  SQS_QUEUE_URL: z.url(),
+  SQS_ENDPOINT: z.url(),
+  AWS_REGION: z.string().default('us-east-1'),
+  AWS_ACCESS_KEY_ID: z.string(),
+  AWS_SECRET_ACCESS_KEY: z.string(),
+  ANTHROPIC_API_KEY: z.string(),
 });
 export const config = EnvSchema.parse(process.env);  // throws on startup if invalid
 ```
@@ -716,18 +708,27 @@ Files created:
 
 ---
 
-### Epic 2 — Async Queue & Orchestration
+### Epic 2 — Async Queue & Orchestration (SQS + LocalStack)
 
 **Files to create:**
-- `src/worker/queue.ts` — BullMQ queue instance + DLQ `failed` listener
+- `src/config/sqs.ts` — SQS client singleton (LocalStack endpoint in dev, real AWS in prod)
+- `src/worker/queue.ts` — `sendMessage`, `receiveMessages`, `deleteMessage` SQS helpers
 - `src/worker/processor.ts` — Main job processor with phase orchestration
-- `src/worker/worker.ts` — Worker entrypoint (started as a separate process via `pm2` or `node`)
-- `src/config/redis.ts` — Redis connection (ioredis)
+- `src/worker/worker.ts` — Polling loop entrypoint (started as a separate process)
+
+**Files to update:**
+- `src/services/ticketService.ts` — add SQS enqueue + `deleteTask` rollback (US-1.1 AC5)
+- `src/repositories/taskRepositories.ts` — add `updateTask()` helper (worker needs it)
+- `src/config/env.ts` — add SQS env vars to Zod schema
+- `docker-compose.yml` — add `localstack` service
+- `.env` — add `SQS_QUEUE_URL`, `SQS_ENDPOINT`, `AWS_*` vars
 
 **Key decisions:**
-- Worker is a **separate Node.js process** from the API server. They share the same Prisma + Redis connections but are started independently. In `docker-compose`, this is a second service (`worker`) with the same image but `CMD` pointing to `src/worker/worker.ts`.
-- Phase checkpoints (`phase1Done`, `phase2Done`) are written to Postgres before returning from each phase function — if the worker crashes mid-job, the next attempt resumes correctly.
-- Per-phase retry counter (`phase1Retries`, `phase2Retries`) is incremented in Postgres before each phase attempt. This is separate from BullMQ's `attemptsMade`.
+- Worker is a **separate Node.js process** from the API server — started independently via `npm run dev:worker`. They share the same Prisma connection but nothing else.
+- Phase checkpoints (`phase1Done`, `phase2Done`) are written to Postgres before each phase completes — if the worker crashes mid-job, the next SQS retry resumes from the correct phase.
+- Per-phase retry counters (`phase1Retries`, `phase2Retries`) are incremented in Postgres before each attempt — source of truth for retry counts.
+- SQS `deleteMessage` is called **only on full job success**. Any throw leaves the message in flight — visibility timeout expires → SQS makes it visible again → worker retries.
+- LocalStack SQS queue must be created before first use: `aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name ticket-queue`
 
 ---
 
@@ -800,43 +801,39 @@ export const PHASE2_FALLBACK_NOTE =
 
 ```yaml
 # docker-compose.yml
-version: '3.9'
 services:
-  postgres:
-    image: postgres:15-alpine
+  db:
+    image: postgres:16-alpine
     environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: testingpassword
       POSTGRES_DB: ticket_pipeline
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: pass
     ports: ['5432:5432']
-    volumes: ['postgres_data:/var/lib/postgresql/data']
+    volumes: ['db_data:/var/lib/postgresql/data']
 
-  redis:
-    image: redis:7-alpine
-    ports: ['6379:6379']
-
-  api:
-    build: .
-    command: npx ts-node-dev src/api/server.ts
-    ports: ['3000:3000']
+  pg_admin:
+    image: dpage/pgadmin4
+    ports: ['8080:80']
     environment:
-      DATABASE_URL: postgresql://user:pass@postgres:5432/ticket_pipeline
-      REDIS_URL: redis://redis:6379
-    depends_on: [postgres, redis]
-    env_file: .env
+      PGADMIN_DEFAULT_EMAIL: mdsadmansaki6@gmail.com
+      PGADMIN_DEFAULT_PASSWORD: testingpassword
+    depends_on: [db]
 
-  worker:
-    build: .
-    command: npx ts-node-dev src/worker/worker.ts
+  localstack:
+    image: localstack/localstack
+    ports: ['4566:4566']
     environment:
-      DATABASE_URL: postgresql://user:pass@postgres:5432/ticket_pipeline
-      REDIS_URL: redis://redis:6379
-    depends_on: [postgres, redis]
-    env_file: .env
+      SERVICES: sqs
 
 volumes:
-  postgres_data:
+  db_data:
 ```
+
+> **Node processes run separately (NOT in docker-compose):**
+> ```
+> npm run dev:server   →  API Server  (port 3000)
+> npm run dev:worker   →  Worker      (polls SQS)
+> ```
 
 ---
 
