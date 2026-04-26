@@ -20,5 +20,11 @@ services:
     depends_on:
       - db
 
+  localstack:              
+      image: localstack/localstack:3.8.1                                        
+      ports:                      
+        - "4566:4566"
+      environment:
+        SERVICES: sqs 
 volumes:
   db_data:
