@@ -51,4 +51,8 @@ workerEvents.on("phase_2_started", ({ taskId }) => {
   console.log(`[event] phase_2_started — taskId: ${taskId}`);
 });
 
+workerEvents.on("task_terminal", ({ taskId, state }) => {
+  console.log(`[event] task_terminal — taskId: ${taskId}, state: ${state}`);
+});
+
 Promise.all([poll(), pollDlq()]);

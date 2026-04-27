@@ -18,7 +18,7 @@ function buildOutputs(task: Task) {
   if (task.state === "completed_with_fallback") {
     return {
       phase_1: task.phase1Output,
-      phase_2: {
+      phase_2: task.phase2Output ?? {
         response_draft: null,
         internal_note:
           "Automated resolution draft could not be generated. Manual review required.",
