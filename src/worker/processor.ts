@@ -2,6 +2,7 @@ import { getTask, updateTask } from "../repositories/taskRepositories.js";
 import { deleteMessage } from "./queue.js";
 import { runPhase1 } from "./phase1.js";
 import { workerEvents } from "./workerEvents.js";
+import { runPhase2 } from "./phase2.js";
 
 const TERMINAL_STATES = [
   "completed",
@@ -55,7 +56,26 @@ export async function processJob(taskId: string, receiptHandle: string) {
   // Phase 2 (Epic 4 AI call goes here)
   const freshTask = await getTask(taskId);
   if (freshTask && freshTask.phase1Done && !freshTask.phase2Done) {
+    if (freshTask.phase2Retries >= MAX_PHASE_RETRIES) {
+      await updateTask(taskId, {
+        state: "completed_with_fallback",
+        currentPhase: null,
+        stateChangedAt: new Date(),
+      });
+      await deleteMessage(receiptHandle);
+      return;
+    }
     await updateTask(taskId, { phase2Retries: { increment: 1 } });
-    // TODO: runPhase2(freshTask.inputTicket, freshTask.phase1Output)
+    const phase2Output = await runPhase2(
+      freshTask.inputTicket,
+      freshTask.phase1Output,
+    );
+    await updateTask(taskId, {
+      phase2Output: phase2Output as object,
+      phase2Done: true,
+      state: "completed",
+      currentPhase: null,
+      stateChangedAt: new Date(),
+    });
   }
 }
