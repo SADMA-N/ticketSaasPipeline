@@ -14,3 +14,4 @@ const EnvSchema = z.object({
 });
 
 export const config = EnvSchema.parse(process.env);
+// To validate + safe access all env here

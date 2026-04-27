@@ -15,8 +15,11 @@ export async function sendMessage(taskId: string) {
   );
 }
 
+//sqs theke msg receive krtechi
 export async function receiveMessages() {
+  // requesting sqs to give me messages
   const response = await sqsClient.send(
+    // Instructing SQS ( which queue + how many messages + long polling time)
     new ReceiveMessageCommand({
       QueueUrl: config.SQS_QUEUE_URL,
       MaxNumberOfMessages: 10,
@@ -34,3 +37,9 @@ export async function deleteMessage(receiptHandle: string) {
     }),
   );
 }
+
+/*
+long pulling 
+Queue khali thakle shate shate return kre na , 20sec wait 
+krbe  which helps for CPU utilization + empty req kom hoi + efficient system
+*/

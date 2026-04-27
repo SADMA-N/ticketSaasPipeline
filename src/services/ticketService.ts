@@ -5,13 +5,14 @@ import { createTask, deleteTask } from "../repositories/taskRepositories.js";
 import type { Ticket } from "../schemas/ticket.js";
 
 export async function submitTicket(ticketData: Ticket) {
-  const task = await createTask(ticketData);
+  const task = await createTask(ticketData); // Db te task create hoi
 
   try {
+    // req to sqs -> new msg send krteChai (which queue + main content)
     await sqsClient.send(
       new SendMessageCommand({
         QueueUrl: config.SQS_QUEUE_URL,
-        MessageBody: JSON.stringify({ taskId: task.id }),
+        MessageBody: JSON.stringify({ taskId: task.id }), // sqs onty take string
       }),
     );
   } catch (err) {

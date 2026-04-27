@@ -31,7 +31,7 @@ export async function processJob(taskId: string, receiptHandle: string) {
   // Phase 1
   if (!task.phase1Done) {
     await updateTask(taskId, { phase1Retries: { increment: 1 } });
-    const phase1Output = await runPhase1(task.inputTicket); // throws → SQS retry
+    const phase1Output = await runPhase1(task.inputTicket); // ticket -> AI -> structured JSON -> (retry safe)
     await updateTask(taskId, {
       phase1Output: phase1Output as object,
       phase1Done: true,

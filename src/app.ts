@@ -1,6 +1,4 @@
 import express, { Request, Response } from "express";
-import cors from "cors";
-import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
 import ticketsRouter from './routes/ticketsRouter.js';
 import tasksRouter from "./routes/tasksRouter.js";
@@ -11,8 +9,6 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(cookieParser());
 app.use(express.json()); // read json from every single req
 
 app.use("/tickets", ticketsRouter);
