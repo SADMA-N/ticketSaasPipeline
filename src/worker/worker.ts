@@ -1,5 +1,27 @@
-import { receiveMessages, deleteMessage } from "./queue.js";
+import { receiveMessages, receiveDlqMessages, deleteMessage } from "./queue.js";
+import { handleDlqMessage } from "./dlqHandler.js";
 import { processJob } from "./processor.js";
+import { workerEvents } from "./workerEvents.js";
+
+async function pollDlq() {
+  console.log("DLQ poller started.");
+  while (true) {
+    try {
+      const messages = await receiveDlqMessages();
+      for (const msg of messages) {
+        const { taskId } = JSON.parse(msg.Body);
+        try {
+          await handleDlqMessage(taskId, msg.ReceiptHandle);
+          console.log(`[dlq] handled taskId: ${taskId}`);
+        } catch (err) {
+          console.error(`DLQ handler failed for taskId ${taskId}:`, err);
+        }
+      }
+    } catch (err) {
+      console.error("DLQ poll error:", err);
+    }
+  }
+}
 
 // SQS queue theke taskId niye , Api theke alada vabe backgrd e processing kre
 async function poll() {
@@ -25,4 +47,8 @@ async function poll() {
   }
 }
 
-poll();
+workerEvents.on("phase_2_started", ({ taskId }) => {
+  console.log(`[event] phase_2_started — taskId: ${taskId}`);
+});
+
+Promise.all([poll(), pollDlq()]);

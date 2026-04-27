@@ -9,6 +9,7 @@
   "scripts": {
     "dev:worker": "node --watch --import tsx/esm src/worker/worker.ts",
     "dev:server": "node --watch --import tsx/esm src/app.ts",
+    "dev:queues": "bash scripts/setup-queues.sh",
     "build": "tsc",
     "test": "vitest"
   },

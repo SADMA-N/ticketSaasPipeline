@@ -11,6 +11,7 @@ const EnvSchema = z.object({
   AWS_SECRET_ACCESS_KEY: z.string(),
   PORTKEY_API_KEY: z.string(),
   PORTKEY_CONFIG_ID: z.string(),
+  SQS_DLQ_URL: z.string(),
 });
 
 export const config = EnvSchema.parse(process.env);

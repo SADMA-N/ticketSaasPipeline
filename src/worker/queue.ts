@@ -38,6 +38,25 @@ export async function deleteMessage(receiptHandle: string) {
   );
 }
 
+export async function receiveDlqMessages() {
+  const response = await sqsClient.send(
+    new ReceiveMessageCommand({
+      QueueUrl: config.SQS_DLQ_URL,
+      MaxNumberOfMessages: 10,
+      WaitTimeSeconds: 20,
+    }),
+  );
+  return response.Messages ?? [];
+}
+
+export async function deleteDlqMessage(receiptHandle: string) {
+  await sqsClient.send(
+    new DeleteMessageCommand({
+      QueueUrl: config.SQS_DLQ_URL,
+      ReceiptHandle: receiptHandle,
+    }),
+  );
+}
 /*
 long pulling 
 Queue khali thakle shate shate return kre na , 20sec wait 
