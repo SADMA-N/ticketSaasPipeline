@@ -1,0 +1,39 @@
+flowchart TD
+    A(["🖥️ Client"])
+
+    A -->|"POST /tickets"| B["🌐 API Server\napp.ts"]
+    A -->|"subscribe to taskId"| G
+
+    B -->|"validate + save task"| C[("🗄️ Database\nPostgreSQL")]
+    B -->|"push taskId"| D[["📬 SQS Queue"]]
+    B -->|"202 + task_id"| A
+
+    D -->|"worker polls"| E["🔧 Worker\nworker.ts"]
+
+    E -->|"processJob()"| F["⚡ Processor\nprocessor.ts"]
+
+    F -->|"Phase 1 AI call"| AI["🤖 AI\nPortkey + Gemini"]
+    F -->|"Phase 2 AI call"| AI
+    AI -->|"result"| F
+
+    F -->|"save progress"| C
+
+    F -->|"every milestone"| G["📡 Emitter\nemitSocketEvent()"]
+
+    G -->|"📝 structured JSON log"| LOG["Terminal stdout\ntask_id, event,\ntimestamp, metadata"]
+    G -->|"🔔 socket event"| A
+
+    D -->|"job fails 3x"| DLQ[["💀 Dead Letter Queue"]]
+    DLQ -->|"pollDlq()"| E
+
+    style A fill:#ecfdf5,stroke:#10b981,color:#000
+    style G fill:#ede9fe,stroke:#7c3aed,color:#000
+    style LOG fill:#fef3c7,stroke:#f59e0b,color:#000
+    style AI fill:#fce7f3,stroke:#ec4899,color:#000
+    style C fill:#f1f5f9,stroke:#64748b,color:#000
+    style D fill:#fff7ed,stroke:#f97316,color:#000
+    style DLQ fill:#fef2f2,stroke:#ef4444,color:#000
+
+
+
+
