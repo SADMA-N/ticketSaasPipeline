@@ -2,6 +2,7 @@ import { receiveMessages, receiveDlqMessages, deleteMessage } from "./queue.js";
 import { handleDlqMessage } from "./dlqHandler.js";
 import { processJob } from "./processor.js";
 import { workerEvents } from "./workerEvents.js";
+import { logger } from "../logger.js";
 
 async function pollDlq() {
   console.log("DLQ poller started.");
@@ -12,9 +13,9 @@ async function pollDlq() {
         const { taskId } = JSON.parse(msg.Body);
         try {
           await handleDlqMessage(taskId, msg.ReceiptHandle);
-          console.log(`[dlq] handled taskId: ${taskId}`);
+          logger.info({ task_id: taskId }, "dlq handled");
         } catch (err) {
-          console.error(`DLQ handler failed for taskId ${taskId}:`, err);
+          logger.error({ task_id: taskId, err }, "dlq handler failed");
         }
       }
     } catch (err) {
@@ -37,7 +38,7 @@ async function poll() {
           await processJob(taskId, msg.ReceiptHandle); // to delete msg sending receiptHandle to sqs
           await deleteMessage(msg.ReceiptHandle);
         } catch (err) {
-          console.error(`Job failed for taskId ${taskId}:`, err);
+          logger.error({ task_id: taskId, err }, "job failed");
           // No deleteMessage — visibility timeout expires → SQS retries
         }
       }
@@ -48,11 +49,14 @@ async function poll() {
 }
 
 workerEvents.on("phase_2_started", ({ taskId }) => {
-  console.log(`[event] phase_2_started — taskId: ${taskId}`);
+  logger.info({ task_id: taskId, event: "phase_2_started" }, "worker event");
 });
 
 workerEvents.on("task_terminal", ({ taskId, state }) => {
-  console.log(`[event] task_terminal — taskId: ${taskId}, state: ${state}`);
+  logger.info(
+    { task_id: taskId, event: "task_terminal", outcome: state },
+    "worker event",
+  );
 });
 
 Promise.all([poll(), pollDlq()]);

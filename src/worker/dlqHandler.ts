@@ -30,7 +30,7 @@ export async function handleDlqMessage(taskId: string, receiptHandle: string) {
       fallbackAt: new Date(),
     }),
   });
-  emitSocketEvent(taskId, newState, { reason: "Exceeded SQS delivery attempts" });
+  emitSocketEvent(taskId, newState, { reason: "Exceeded SQS delivery attempts", duration_ms: Date.now() - task.createdAt.getTime() });
   workerEvents.emit("task_terminal", { taskId, state: newState });
 
   await deleteDlqMessage(receiptHandle);

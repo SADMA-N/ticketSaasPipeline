@@ -42,7 +42,10 @@ export async function processJob(taskId: string, receiptHandle: string) {
         currentPhase: null,
         stateChangedAt: new Date(),
       });
-      emitSocketEvent(taskId, "needs_manual_review", { reason: "Phase 1 retry limit exceeded" });
+      emitSocketEvent(taskId, "needs_manual_review", {
+        reason: "Phase 1 retry limit exceeded",
+        duration_ms: Date.now() - task.createdAt.getTime(),
+      });
       workerEvents.emit("task_terminal", {
         taskId,
         state: "needs_manual_review",
@@ -51,7 +54,10 @@ export async function processJob(taskId: string, receiptHandle: string) {
       return;
     }
     if (task.phase1Retries > 0) {
-      emitSocketEvent(taskId, "retry", { phase: "phase_1", attempt: task.phase1Retries + 1 });
+      emitSocketEvent(taskId, "retry", {
+        phase: "phase_1",
+        attempt: task.phase1Retries + 1,
+      });
     }
     emitSocketEvent(taskId, "phase_1_started");
     await updateTask(taskId, { phase1Retries: { increment: 1 } });
@@ -82,7 +88,10 @@ export async function processJob(taskId: string, receiptHandle: string) {
         fallbackReason: "Phase 2 retry limit exceeded",
         fallbackAt: new Date(),
       });
-      emitSocketEvent(taskId, "completed_with_fallback", { reason: "Phase 2 retry limit exceeded" });
+      emitSocketEvent(taskId, "completed_with_fallback", {
+        reason: "Phase 2 retry limit exceeded",
+        duration_ms: Date.now() - freshTask.createdAt.getTime(),
+      });
       workerEvents.emit("task_terminal", {
         taskId,
         state: "completed_with_fallback",
@@ -91,7 +100,10 @@ export async function processJob(taskId: string, receiptHandle: string) {
       return;
     }
     if (freshTask.phase2Retries > 0) {
-      emitSocketEvent(taskId, "retry", { phase: "phase_2", attempt: freshTask.phase2Retries + 1 });
+      emitSocketEvent(taskId, "retry", {
+        phase: "phase_2",
+        attempt: freshTask.phase2Retries + 1,
+      });
     }
     emitSocketEvent(taskId, "phase_2_started");
     await updateTask(taskId, { phase2Retries: { increment: 1 } });
@@ -107,7 +119,9 @@ export async function processJob(taskId: string, receiptHandle: string) {
       stateChangedAt: new Date(),
     });
     emitSocketEvent(taskId, "phase_2_complete");
-    emitSocketEvent(taskId, "completed");
+    emitSocketEvent(taskId, "completed", {
+      duration_ms: Date.now() - freshTask.createdAt.getTime(),
+    });
     workerEvents.emit("task_terminal", { taskId, state: "completed" });
   }
 }
