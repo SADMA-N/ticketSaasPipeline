@@ -1,3 +1,4 @@
+// Socket.IO  diye real-time event pathano (task processing status)
 import { Server } from "socket.io";
 import type { Server as HttpServer } from "http";
 import { logger } from "../logger.js";
@@ -26,25 +27,50 @@ const EVENT_PHASE: Partial<Record<SocketEventName, string>> = {
   phase_2_complete: "phase_2",
 };
 
-// io variable e socket server rakha hbe , now its empty but initSocket call howar por http server er sathe bind kore socket server ready thakbe emit er jonno
-let io: Server;
+// Read directly from process.env
+const CORS_ORIGIN = process.env["SOCKET_CORS_ORIGIN"] ?? "*";
 
-// to setup socket server  // httpserver already chola server (Express/Node)
-export function initSocket(httpServer: HttpServer) {
-  io = new Server(httpServer, { cors: { origin: "*" } }); // CORS policy allow from all origins
+const taskRoom = (taskId: string) => `task:${taskId}`;
 
+let io: Server | undefined;
+
+//HTTP server er upr Socket.IO chaluKra + client k fixed task room e join krano
+export function initSocket(httpServer: HttpServer): void {
+  if (io) {
+    logger.warn(
+      "initSocket called while socket server already running — ignoring",
+    );
+    return;
+  }
+
+  io = new Server(httpServer, { cors: { origin: CORS_ORIGIN } }); // creating socket.io server upon HTTP server
+
+  // Listen for client connections and handle "subscribe" events to join task-specific rooms
   io.on("connection", (socket) => {
-    socket.on("subscribe", (taskId: string) => socket.join(`task:${taskId}`));
-    //socket = connection of that user
+    socket.on("subscribe", (taskId: unknown) => {
+      if (typeof taskId !== "string" || taskId.trim() === "") {
+        logger.warn({ taskId }, "Invalid subscribe payload — rejected");
+        return;
+      }
+      socket.join(taskRoom(taskId)); // entered client into task-specific room
+    });
   });
+}
+
+//graceful shutdown
+export async function closeSocket(): Promise<void> {
+  if (!io) return;
+  await io.close();
+  io = undefined;
 }
 
 export function emitSocketEvent(
   taskId: string,
   event: SocketEventName,
   metadata: Record<string, unknown> = {},
-) {
-  const phase = (metadata.phase as string | undefined) ?? EVENT_PHASE[event];
+): void {
+  const phase =
+    typeof metadata.phase === "string" ? metadata.phase : EVENT_PHASE[event];
   const outcome = TERMINAL_EVENTS.has(event) ? event : undefined;
 
   const payload = {
@@ -63,6 +89,15 @@ export function emitSocketEvent(
     "socket event",
   );
 
-  if (!io) return;
-  io.to(`task:${taskId}`).emit(event, payload); // task:${taskId} room e data emit kora hbe
+  if (!io) {
+    // Expected in worker process — io only exists in API server process.
+    logger.debug(
+      { task_id: taskId, event },
+      "Socket emit skipped — io not initialized",
+    );
+    return;
+  }
+
+  io.to(taskRoom(taskId)).emit(event, payload);
+  //taskId specific room e emit krbe event + payload
 }

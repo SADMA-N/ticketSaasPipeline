@@ -1,8 +1,8 @@
 import { Router } from "express";
 import { submitTickets } from "../controllers/ticketsController.js";
 
-const ticketRouter = Router();
+const ticketsRouter = Router({ strict: true, caseSensitive: true });
 
-ticketRouter.post("/", submitTickets);
+ticketsRouter.post("/", submitTickets);
 
-export default ticketRouter;
+export default ticketsRouter;

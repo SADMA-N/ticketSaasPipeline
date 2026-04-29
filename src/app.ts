@@ -1,34 +1,53 @@
-import express, { Request, Response } from "express";
-import { createServer } from "http";
-import dotenv from "dotenv";
-import ticketsRouter from './routes/ticketsRouter.js';
-import tasksRouter from "./routes/tasksRouter.js";
-import { initSocket } from "./socket/emitter.js";
+import { createServer, Server } from "http";
+import app from "./app.setup.js";
+import { config } from "./config/env.js";
+import { logger } from "./logger.js";
+import { initSocket, closeSocket } from "./socket/emitter.js";
+import { prisma } from "./lib/prisma.js";
 
-dotenv.config();
+export function buildHttpServer(): Server {
+  const httpServer = createServer(app); // express app http server create kre
+  initSocket(httpServer); // Socket attach to get real-time updates
+  return httpServer;
+}
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+//graceful shutdown
+export function registerShutdownHandlers(server: Server): void {
+  
+  async function shutdown(signal: string): Promise<void> {
+    logger.info({ signal }, "Shutdown signal received");
 
-app.use(express.json()); // read json from every single req
+    setTimeout(() => {
+      logger.error("Graceful shutdown timed out — forcing exit");
+      process.exit(1);
+    }, 10_000).unref(); // wait till 10s
 
-app.use("/tickets", ticketsRouter);
-app.use("/tasks", tasksRouter);
+    server.closeAllConnections();
+    server.close(async (err) => {// closing taking new req
+      if (err) {
+        logger.error(err, "Error during graceful shutdown");
+        process.exit(1);
+      }
+      await closeSocket(); // closeing socket connections
+      await prisma.$disconnect();// closeing db connections
+      logger.info("Server closed gracefully");
+      process.exit(0);
+    });
+  }
 
-//handle error
-app.use((req : Request, res : Response) => {
-  res.status(404).json({
-    status: "404 fail",
-    message: "Route not found",
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => shutdown("SIGINT"));
+}
+
+export function startServer(): Server {
+  const server = buildHttpServer();
+
+  server.listen(config.PORT, () => {
+    logger.info({ port: config.PORT }, "Server running");
   });
-});
 
-// Express app k wrap kre raw HTTP server banai ( controled by me )
-const httpServer = createServer(app);
-initSocket(httpServer); // attached http server with Socket.IO 
+  registerShutdownHandlers(server);
+  return server;
+}
 
-httpServer.listen(PORT, () => {
-  console.log(`Server is running on port http://localhost:${PORT}/`);
-});
-
-//it can attach to the main HTTP server and enable real-time communication alongside Express.
+startServer();

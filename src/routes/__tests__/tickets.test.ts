@@ -1,5 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import request from "supertest";
+import request from "supertest"; // API call simulate
+import app, { createApp } from "../../app.setup.js";
+import { submitTicket } from "../../services/ticketService.js";
+import { getTaskById } from "../../services/taskService.js";
+import { TaskState } from "../../../generated/prisma/enums.js";
+
+/*
+checking api is woring properly or not and also checking the error handling and validation of the api
+Middleware (requestId, JSON limit, headers)
+POST /tickets API
+GET /tasks API
+*/
 
 vi.mock("../../services/ticketService.js", () => ({
   submitTicket: vi.fn(),
@@ -9,10 +20,7 @@ vi.mock("../../services/taskService.js", () => ({
   getTaskById: vi.fn(),
 }));
 
-import app from "../../app.setup.js";
-import { submitTicket } from "../../services/ticketService.js";
-import { getTaskById } from "../../services/taskService.js";
-
+//reusable valid input
 const validTicket = {
   subject: "Login broken",
   body: "Cannot login since yesterday. Getting 401.",
@@ -21,12 +29,12 @@ const validTicket = {
 
 const mockTaskResponse = {
   task_id: "e061743d-e047-46a4-acdd-cff8b8dc503e",
-  state: "pending",
+  state: TaskState.pending,
   current_phase: null,
   retry_count: { phase_1: 0, phase_2: 0 },
-  created_at: new Date().toISOString(),
-  state_changed_at: new Date().toISOString(),
-  last_mutated_at: new Date().toISOString(),
+  created_at: new Date(),
+  state_changed_at: new Date(),
+  last_mutated_at: new Date(),
   outputs: null,
   input_ticket: null,
   fallback_info: null,
@@ -37,9 +45,56 @@ beforeEach(() => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+describe("middleware", () => {
+  it("generates x-request-id when client does not provide one", async () => {
+    const res = await request(app).get("/unknown-route");
+    expect(res.headers["x-request-id"]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+  });
+
+  it("echoes x-request-id when client provides one", async () => {
+    const clientId = "my-trace-id-abc123";
+    const res = await request(app)
+      .get("/unknown-route")
+      .set("x-request-id", clientId);
+    expect(res.headers["x-request-id"]).toBe(clientId);
+  });
+
+  it("returns 413 when payload exceeds 100kb", async () => {
+    const res = await request(app)
+      .post("/tickets")
+      .set("Content-Type", "application/json")
+      .send(JSON.stringify({ data: "x".repeat(110 * 1024) }));
+    expect(res.status).toBe(413);
+  });
+
+  it("does not expose X-Powered-By header", async () => {
+    const res = await request(app).get("/unknown-route");
+    expect(res.headers["x-powered-by"]).toBeUndefined();
+  });
+
+  it("returns 500 when handler throws a non-Error value", async () => {
+    vi.mocked(submitTicket).mockRejectedValue("string error");
+    const res = await request(app).post("/tickets").send(validTicket);
+    expect(res.status).toBe(500);
+    expect(res.body).toMatchObject({
+      status: "error",
+      message: "Internal server error",
+    });
+  });
+
+  it("createApp returns a new instance on each call", () => {
+    const app1 = createApp();
+    const app2 = createApp();
+    expect(app1).not.toBe(app2);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 describe("POST /tickets", () => {
   it("returns 202 with task_id, state, status_url on valid ticket", async () => {
-    (submitTicket as ReturnType<typeof vi.fn>).mockResolvedValue({
+    vi.mocked(submitTicket).mockResolvedValue({
       task_id: "e061743d-e047-46a4-acdd-cff8b8dc503e",
       state: "pending",
       status_url: "/tasks/e061743d-e047-46a4-acdd-cff8b8dc503e",
@@ -74,11 +129,13 @@ describe("POST /tickets", () => {
   });
 
   it("returns 400 when customer email is invalid", async () => {
-    const res = await request(app).post("/tickets").send({
-      subject: "Test",
-      body: "Test body",
-      customer: { id: "c1", email: "not-an-email" },
-    });
+    const res = await request(app)
+      .post("/tickets")
+      .send({
+        subject: "Test",
+        body: "Test body",
+        customer: { id: "c1", email: "not-an-email" },
+      });
 
     expect(res.status).toBe(400);
     expect(res.body).toMatchObject({ error: "Validation failed" });
@@ -93,11 +150,13 @@ describe("POST /tickets", () => {
   });
 
   it("returns 400 when body is empty string", async () => {
-    const res = await request(app).post("/tickets").send({
-      subject: "Test",
-      body: "",
-      customer: { id: "c1", email: "a@b.com" },
-    });
+    const res = await request(app)
+      .post("/tickets")
+      .send({
+        subject: "Test",
+        body: "",
+        customer: { id: "c1", email: "a@b.com" },
+      });
 
     expect(res.status).toBe(400);
   });
@@ -106,9 +165,17 @@ describe("POST /tickets", () => {
     const id1 = "aaaaaaaa-0000-0000-0000-000000000001";
     const id2 = "aaaaaaaa-0000-0000-0000-000000000002";
 
-    (submitTicket as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce({ task_id: id1, state: "pending", status_url: `/tasks/${id1}` })
-      .mockResolvedValueOnce({ task_id: id2, state: "pending", status_url: `/tasks/${id2}` });
+    vi.mocked(submitTicket)
+      .mockResolvedValueOnce({
+        task_id: id1,
+        state: "pending",
+        status_url: `/tasks/${id1}`,
+      })
+      .mockResolvedValueOnce({
+        task_id: id2,
+        state: "pending",
+        status_url: `/tasks/${id2}`,
+      });
 
     const res1 = await request(app).post("/tickets").send(validTicket);
     const res2 = await request(app).post("/tickets").send(validTicket);
@@ -117,7 +184,7 @@ describe("POST /tickets", () => {
   });
 
   it("accepts optional metadata field", async () => {
-    (submitTicket as ReturnType<typeof vi.fn>).mockResolvedValue({
+    vi.mocked(submitTicket).mockResolvedValue({
       task_id: "e061743d-e047-46a4-acdd-cff8b8dc503e",
       state: "pending",
       status_url: "/tasks/e061743d-e047-46a4-acdd-cff8b8dc503e",
@@ -134,7 +201,7 @@ describe("POST /tickets", () => {
 // ════════════════════════════════════════════════════════════════════════════
 describe("GET /tasks/:taskId", () => {
   it("returns 200 with full task shape when task exists", async () => {
-    (getTaskById as ReturnType<typeof vi.fn>).mockResolvedValue(mockTaskResponse);
+    vi.mocked(getTaskById).mockResolvedValue(mockTaskResponse);
 
     const res = await request(app).get(
       "/tasks/e061743d-e047-46a4-acdd-cff8b8dc503e",
@@ -149,7 +216,7 @@ describe("GET /tasks/:taskId", () => {
   });
 
   it("returns 404 when task does not exist", async () => {
-    (getTaskById as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+    vi.mocked(getTaskById).mockResolvedValue(null);
 
     const res = await request(app).get(
       "/tasks/00000000-0000-0000-0000-000000000000",
@@ -167,7 +234,7 @@ describe("GET /tasks/:taskId", () => {
   });
 
   it("response includes outputs field", async () => {
-    (getTaskById as ReturnType<typeof vi.fn>).mockResolvedValue(mockTaskResponse);
+    vi.mocked(getTaskById).mockResolvedValue(mockTaskResponse);
 
     const res = await request(app).get(
       "/tasks/e061743d-e047-46a4-acdd-cff8b8dc503e",
@@ -178,7 +245,7 @@ describe("GET /tasks/:taskId", () => {
   });
 
   it("response includes fallback_info field", async () => {
-    (getTaskById as ReturnType<typeof vi.fn>).mockResolvedValue(mockTaskResponse);
+    vi.mocked(getTaskById).mockResolvedValue(mockTaskResponse);
 
     const res = await request(app).get(
       "/tasks/e061743d-e047-46a4-acdd-cff8b8dc503e",
