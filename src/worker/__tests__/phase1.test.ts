@@ -49,9 +49,9 @@ describe("Phase 1 — representative ticket samples", () => {
       summary: "Customer was charged twice for the same subscription.",
     };
 
-    (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockResolvedValue(
-      mockLLMResponse(aiOutput),
-    );
+    (
+      portkey.chat.completions.create as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(mockLLMResponse(aiOutput));
 
     const result = await runPhase1({
       subject: "Charged twice this month",
@@ -82,9 +82,9 @@ describe("Phase 1 — representative ticket samples", () => {
       summary: "Customer's entire team cannot access the platform.",
     };
 
-    (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockResolvedValue(
-      mockLLMResponse(aiOutput),
-    );
+    (
+      portkey.chat.completions.create as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(mockLLMResponse(aiOutput));
 
     const result = await runPhase1({
       subject: "Production down — urgent",
@@ -108,9 +108,9 @@ describe("Phase 1 — representative ticket samples", () => {
       summary: "Customer asking about available pricing plans.",
     };
 
-    (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockResolvedValue(
-      mockLLMResponse(aiOutput),
-    );
+    (
+      portkey.chat.completions.create as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(mockLLMResponse(aiOutput));
 
     const result = await runPhase1({
       subject: "Pricing plans question",
@@ -126,9 +126,77 @@ describe("Phase 1 — representative ticket samples", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+describe("Phase 1 — network errors", () => {
+  it("passes through network error when all retries exhausted", async () => {
+    const networkErr = Object.assign(new Error("Network failure"), {
+      status: 503,
+    });
+
+    (
+      portkey.chat.completions.create as ReturnType<typeof vi.fn>
+    ).mockRejectedValue(networkErr);
+
+    await expect(
+      runPhase1({
+        subject: "Test",
+        body: "Test body",
+        customer: { id: "c1", email: "a@b.com" },
+      }),
+    ).rejects.toThrow("Network failure");
+  });
+
+  it("retries on transient 429 and succeeds on next attempt", async () => {
+    const rateLimitErr = Object.assign(new Error("Rate limited"), {
+      status: 429,
+    });
+    const aiOutput = {
+      category: "billing",
+      priority: "high",
+      sentiment: "negative",
+      escalation_flag: false,
+      routing_target: "billing-team",
+      summary: "Double charge",
+    };
+
+    (portkey.chat.completions.create as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(rateLimitErr)
+      .mockResolvedValueOnce(mockLLMResponse(aiOutput));
+
+    const result = await runPhase1({
+      subject: "Test",
+      body: "Test body",
+      customer: { id: "c1", email: "a@b.com" },
+    });
+
+    expect(result.category).toBe("billing");
+    expect(portkey.chat.completions.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry on non-transient 400 error", async () => {
+    const clientErr = Object.assign(new Error("Bad request"), { status: 400 });
+
+    (
+      portkey.chat.completions.create as ReturnType<typeof vi.fn>
+    ).mockRejectedValue(clientErr);
+
+    await expect(
+      runPhase1({
+        subject: "Test",
+        body: "Test body",
+        customer: { id: "c1", email: "a@b.com" },
+      }),
+    ).rejects.toThrow("Bad request");
+
+    expect(portkey.chat.completions.create).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 describe("Phase 1 — invalid AI responses caught", () => {
   it("throws Phase1Error when AI returns missing required fields", async () => {
-    (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockResolvedValue(
+    (
+      portkey.chat.completions.create as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(
       mockLLMResponse({
         category: "billing",
         // missing priority, sentiment, escalation_flag, routing_target, summary
@@ -145,7 +213,9 @@ describe("Phase 1 — invalid AI responses caught", () => {
   });
 
   it("throws Phase1Error when AI returns invalid enum value for priority", async () => {
-    (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockResolvedValue(
+    (
+      portkey.chat.completions.create as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(
       mockLLMResponse({
         category: "billing",
         priority: "SUPER_URGENT", // not in enum
@@ -166,7 +236,9 @@ describe("Phase 1 — invalid AI responses caught", () => {
   });
 
   it("throws Phase1Error when AI returns no tool call", async () => {
-    (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+    (
+      portkey.chat.completions.create as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({
       choices: [{ message: { tool_calls: [] } }],
     });
 
@@ -180,7 +252,9 @@ describe("Phase 1 — invalid AI responses caught", () => {
   });
 
   it("throws Phase1Error when AI returns empty choices", async () => {
-    (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+    (
+      portkey.chat.completions.create as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({
       choices: [],
     });
 

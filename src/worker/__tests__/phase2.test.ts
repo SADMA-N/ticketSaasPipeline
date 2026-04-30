@@ -152,6 +152,58 @@ describe("Phase 2 — representative ticket + Phase 1 output pairs", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+describe("Phase 2 — network errors", () => {
+  it("passes through network error when all retries exhausted", async () => {
+    const networkErr = Object.assign(new Error("Network failure"), { status: 503 });
+
+    (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockRejectedValue(networkErr);
+
+    await expect(
+      runPhase2(
+        { subject: "Test", body: "Test body", customer: { id: "c1", email: "a@b.com" } },
+        billingTriage,
+      ),
+    ).rejects.toThrow("Network failure");
+  });
+
+  it("retries on transient 429 and succeeds on next attempt", async () => {
+    const rateLimitErr = Object.assign(new Error("Rate limited"), { status: 429 });
+    const aiOutput = {
+      response_draft: "[DRAFT] Refund initiated.",
+      internal_note: "Refund processed.",
+      next_actions: ["issue_refund"],
+    };
+
+    (portkey.chat.completions.create as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(rateLimitErr)
+      .mockResolvedValueOnce(mockLLMResponse(aiOutput));
+
+    const result = await runPhase2(
+      { subject: "Test", body: "Test body", customer: { id: "c1", email: "a@b.com" } },
+      billingTriage,
+    );
+
+    expect(result.response_draft).toContain("[DRAFT]");
+    expect(portkey.chat.completions.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry on non-transient 400 error", async () => {
+    const clientErr = Object.assign(new Error("Bad request"), { status: 400 });
+
+    (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockRejectedValue(clientErr);
+
+    await expect(
+      runPhase2(
+        { subject: "Test", body: "Test body", customer: { id: "c1", email: "a@b.com" } },
+        billingTriage,
+      ),
+    ).rejects.toThrow("Bad request");
+
+    expect(portkey.chat.completions.create).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 describe("Phase 2 — invalid AI responses caught", () => {
   it("throws Phase2Error when AI returns missing required fields", async () => {
     (portkey.chat.completions.create as ReturnType<typeof vi.fn>).mockResolvedValue(
