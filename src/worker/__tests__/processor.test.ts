@@ -6,6 +6,7 @@ vi.mock("../../repositories/taskRepositories.js", () => ({
   updateTask: vi.fn(),
 }));
 
+// queue.js mocked to assert processJob never acks messages directly
 vi.mock("../queue.js", () => ({
   deleteMessage: vi.fn(),
 }));
@@ -33,9 +34,26 @@ import { deleteMessage } from "../queue.js";
 import { runPhase1 } from "../phase1.js";
 import { runPhase2 } from "../phase2.js";
 import { emitSocketEvent } from "../../socket/emitter.js";
+import { workerEvents } from "../workerEvents.js";
+
+// ── shared fixtures ──────────────────────────────────────────────────────────
+const PHASE1_OUTPUT = {
+  category: "billing",
+  priority: "high",
+  sentiment: "negative",
+  escalation_flag: false,
+  routing_target: "billing-team",
+  summary: "Double charge",
+} as const;
+
+const PHASE2_OUTPUT = {
+  response_draft: "[DRAFT] Sorry for the inconvenience.",
+  internal_note: "Refund needed",
+  next_actions: ["issue_refund"],
+};
 
 // ── base task factory ────────────────────────────────────────────────────────
-function makeTask(overrides = {}) {
+function makeTask(overrides: Record<string, unknown> = {}) {
   return {
     id: "task-123",
     state: "pending",
@@ -60,25 +78,90 @@ function makeTask(overrides = {}) {
   };
 }
 
-const RECEIPT = "receipt-handle-abc";
+// sets up mocks for a full happy-path run (phase1 → phase2 → completed)
+function setupBothPhasesMock() {
+  const task = makeTask();
+  const freshTask = { ...task, phase1Done: true, phase1Output: PHASE1_OUTPUT };
+  vi.mocked(getTask)
+    .mockResolvedValueOnce(task as never)
+    .mockResolvedValueOnce(freshTask as never);
+  vi.mocked(runPhase1).mockResolvedValue(PHASE1_OUTPUT);
+  vi.mocked(runPhase2).mockResolvedValue(PHASE2_OUTPUT);
+}
 
 beforeEach(() => {
-  vi.clearAllMocks();
-  (updateTask as ReturnType<typeof vi.fn>).mockResolvedValue({});
-  (deleteMessage as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  vi.resetAllMocks(); // clears call history + implementations — prevents stale mock leakage
+  vi.mocked(updateTask).mockResolvedValue({} as never);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+describe("Ack ownership — processJob never calls deleteMessage", () => {
+  it("does not delete message when task not found", async () => {
+    vi.mocked(getTask).mockResolvedValue(null);
+    await processJob("task-123");
+    expect(deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not delete message when task is already terminal", async () => {
+    vi.mocked(getTask).mockResolvedValue(
+      makeTask({ state: "completed" }) as never,
+    );
+    await processJob("task-123");
+    expect(deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not delete message when phase 1 retry limit reached", async () => {
+    vi.mocked(getTask).mockResolvedValue(
+      makeTask({ phase1Retries: 3 }) as never,
+    );
+    await processJob("task-123");
+    expect(deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not delete message when phase 2 retry limit reached", async () => {
+    const task = makeTask({
+      phase1Done: true,
+      phase1Output: { foo: "bar" },
+      phase2Retries: 3,
+    });
+    vi.mocked(getTask)
+      .mockResolvedValueOnce(task as never)
+      .mockResolvedValueOnce(task as never);
+    await processJob("task-123");
+    expect(deleteMessage).not.toHaveBeenCalled();
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+describe("Early return — no phases run", () => {
+  it.each([
+    "completed",
+    "completed_with_fallback",
+    "needs_manual_review",
+  ] as const)("skips all work when task state is %s", async (state) => {
+    vi.mocked(getTask).mockResolvedValue(makeTask({ state }) as never);
+    await processJob("task-123");
+    expect(runPhase1).not.toHaveBeenCalled();
+    expect(runPhase2).not.toHaveBeenCalled();
+  });
+
+  it("skips all work when task not found in DB", async () => {
+    vi.mocked(getTask).mockResolvedValue(null);
+    await processJob("task-123");
+    expect(runPhase1).not.toHaveBeenCalled();
+    expect(runPhase2).not.toHaveBeenCalled();
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
 describe("Phase 1 simulated failures", () => {
   it("increments phase1Retries and throws when Phase 1 fails", async () => {
-    (getTask as ReturnType<typeof vi.fn>).mockResolvedValue(
-      makeTask({ phase1Retries: 0 }),
+    vi.mocked(getTask).mockResolvedValue(
+      makeTask({ phase1Retries: 0 }) as never,
     );
-    (runPhase1 as ReturnType<typeof vi.fn>).mockRejectedValue(
-      new Error("AI timeout"),
-    );
+    vi.mocked(runPhase1).mockRejectedValue(new Error("AI timeout"));
 
-    await expect(processJob("task-123", RECEIPT)).rejects.toThrow("AI timeout");
+    await expect(processJob("task-123")).rejects.toThrow("AI timeout");
 
     expect(updateTask).toHaveBeenCalledWith(
       "task-123",
@@ -87,30 +170,25 @@ describe("Phase 1 simulated failures", () => {
   });
 
   it("sets needs_manual_review when phase1Retries hits limit (3)", async () => {
-    (getTask as ReturnType<typeof vi.fn>).mockResolvedValue(
-      makeTask({ phase1Retries: 3 }),
+    vi.mocked(getTask).mockResolvedValue(
+      makeTask({ phase1Retries: 3 }) as never,
     );
 
-    await processJob("task-123", RECEIPT);
+    await processJob("task-123");
 
     expect(updateTask).toHaveBeenCalledWith(
       "task-123",
       expect.objectContaining({ state: "needs_manual_review" }),
     );
-    expect(deleteMessage).toHaveBeenCalledWith(RECEIPT);
   });
 
   it("emits retry event with phase and attempt on Phase 1 retry", async () => {
-    const { emitSocketEvent } = await import("../../socket/emitter.js");
-
-    (getTask as ReturnType<typeof vi.fn>).mockResolvedValue(
-      makeTask({ phase1Retries: 1 }),
+    vi.mocked(getTask).mockResolvedValue(
+      makeTask({ phase1Retries: 1 }) as never,
     );
-    (runPhase1 as ReturnType<typeof vi.fn>).mockRejectedValue(
-      new Error("fail"),
-    );
+    vi.mocked(runPhase1).mockRejectedValue(new Error("fail"));
 
-    await expect(processJob("task-123", RECEIPT)).rejects.toThrow();
+    await expect(processJob("task-123")).rejects.toThrow();
 
     expect(emitSocketEvent).toHaveBeenCalledWith(
       "task-123",
@@ -123,23 +201,17 @@ describe("Phase 1 simulated failures", () => {
 // ════════════════════════════════════════════════════════════════════════════
 describe("Phase 2 simulated failures", () => {
   it("increments phase2Retries and throws when Phase 2 fails", async () => {
-    const phase1Task = makeTask({
+    const task = makeTask({
       phase1Done: true,
       phase1Output: { foo: "bar" },
       phase2Retries: 0,
     });
+    vi.mocked(getTask)
+      .mockResolvedValueOnce(task as never)
+      .mockResolvedValueOnce(task as never);
+    vi.mocked(runPhase2).mockRejectedValue(new Error("Phase 2 AI error"));
 
-    (getTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce(phase1Task) // first getTask call
-      .mockResolvedValueOnce(phase1Task); // freshTask call
-
-    (runPhase2 as ReturnType<typeof vi.fn>).mockRejectedValue(
-      new Error("Phase 2 AI error"),
-    );
-
-    await expect(processJob("task-123", RECEIPT)).rejects.toThrow(
-      "Phase 2 AI error",
-    );
+    await expect(processJob("task-123")).rejects.toThrow("Phase 2 AI error");
 
     expect(updateTask).toHaveBeenCalledWith(
       "task-123",
@@ -148,43 +220,35 @@ describe("Phase 2 simulated failures", () => {
   });
 
   it("sets completed_with_fallback when phase2Retries hits limit (3)", async () => {
-    const phase1Task = makeTask({
+    const task = makeTask({
       phase1Done: true,
       phase1Output: { foo: "bar" },
       phase2Retries: 3,
     });
+    vi.mocked(getTask)
+      .mockResolvedValueOnce(task as never)
+      .mockResolvedValueOnce(task as never);
 
-    (getTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce(phase1Task)
-      .mockResolvedValueOnce(phase1Task);
-
-    await processJob("task-123", RECEIPT);
+    await processJob("task-123");
 
     expect(updateTask).toHaveBeenCalledWith(
       "task-123",
       expect.objectContaining({ state: "completed_with_fallback" }),
     );
-    expect(deleteMessage).toHaveBeenCalledWith(RECEIPT);
   });
 
   it("emits retry event with phase and attempt on Phase 2 retry", async () => {
-    const { emitSocketEvent } = await import("../../socket/emitter.js");
-
-    const phase1Task = makeTask({
+    const task = makeTask({
       phase1Done: true,
       phase1Output: { foo: "bar" },
       phase2Retries: 2,
     });
+    vi.mocked(getTask)
+      .mockResolvedValueOnce(task as never)
+      .mockResolvedValueOnce(task as never);
+    vi.mocked(runPhase2).mockRejectedValue(new Error("fail"));
 
-    (getTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce(phase1Task)
-      .mockResolvedValueOnce(phase1Task);
-
-    (runPhase2 as ReturnType<typeof vi.fn>).mockRejectedValue(
-      new Error("fail"),
-    );
-
-    await expect(processJob("task-123", RECEIPT)).rejects.toThrow();
+    await expect(processJob("task-123")).rejects.toThrow();
 
     expect(emitSocketEvent).toHaveBeenCalledWith(
       "task-123",
@@ -195,55 +259,11 @@ describe("Phase 2 simulated failures", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-describe("Idempotency", () => {
-  it("skips processing if task already in terminal state", async () => {
-    (getTask as ReturnType<typeof vi.fn>).mockResolvedValue(
-      makeTask({ state: "completed" }),
-    );
-
-    await processJob("task-123", RECEIPT);
-
-    expect(runPhase1).not.toHaveBeenCalled();
-    expect(runPhase2).not.toHaveBeenCalled();
-    expect(deleteMessage).toHaveBeenCalledWith(RECEIPT);
-  });
-
-  it("skips if task not found", async () => {
-    (getTask as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-
-    await processJob("task-123", RECEIPT);
-
-    expect(runPhase1).not.toHaveBeenCalled();
-    expect(deleteMessage).toHaveBeenCalledWith(RECEIPT);
-  });
-});
-
-// ════════════════════════════════════════════════════════════════════════════
 describe("Happy path — both phases succeed", () => {
   it("runs phase1 then phase2 and reaches completed state", async () => {
-    const task = makeTask({ phase1Retries: 0, phase2Retries: 0 });
-    const phase1Output = {
-      category: "billing",
-      priority: "high",
-      sentiment: "negative",
-      escalation_flag: false,
-      routing_target: "billing-team",
-      summary: "Double charge",
-    };
-    const phase2Output = {
-      response_draft: "[DRAFT] Sorry",
-      internal_note: "Refund needed",
-      next_actions: ["issue_refund"],
-    };
+    setupBothPhasesMock();
 
-    (getTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce(task)
-      .mockResolvedValueOnce({ ...task, phase1Done: true, phase1Output });
-
-    (runPhase1 as ReturnType<typeof vi.fn>).mockResolvedValue(phase1Output);
-    (runPhase2 as ReturnType<typeof vi.fn>).mockResolvedValue(phase2Output);
-
-    await processJob("task-123", RECEIPT);
+    await processJob("task-123");
 
     expect(runPhase1).toHaveBeenCalledTimes(1);
     expect(runPhase2).toHaveBeenCalledTimes(1);
@@ -254,33 +274,11 @@ describe("Happy path — both phases succeed", () => {
   });
 
   it("emits started → phase_1_started → phase_1_complete → phase_2_started → phase_2_complete → completed events in order", async () => {
-    const task = makeTask({ phase1Retries: 0, phase2Retries: 0 });
-    const phase1Output = {
-      category: "billing",
-      priority: "high",
-      sentiment: "negative",
-      escalation_flag: false,
-      routing_target: "billing-team",
-      summary: "Double charge",
-    };
-    const phase2Output = {
-      response_draft: "[DRAFT] Sorry",
-      internal_note: "Refund needed",
-      next_actions: ["issue_refund"],
-    };
+    setupBothPhasesMock();
 
-    (getTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce(task)
-      .mockResolvedValueOnce({ ...task, phase1Done: true, phase1Output });
+    await processJob("task-123");
 
-    (runPhase1 as ReturnType<typeof vi.fn>).mockResolvedValue(phase1Output);
-    (runPhase2 as ReturnType<typeof vi.fn>).mockResolvedValue(phase2Output);
-
-    await processJob("task-123", RECEIPT);
-
-    const emitCalls = (
-      emitSocketEvent as ReturnType<typeof vi.fn>
-    ).mock.calls.map((c) => c[1]);
+    const emitCalls = vi.mocked(emitSocketEvent).mock.calls.map((c) => c[1]);
     expect(emitCalls).toEqual([
       "started",
       "phase_1_started",
@@ -292,28 +290,17 @@ describe("Happy path — both phases succeed", () => {
   });
 
   it("skips phase 1 when phase1Done already true (resumes at phase 2)", async () => {
-    const phase1Output = {
-      category: "billing",
-      priority: "high",
-      sentiment: "negative",
-      escalation_flag: false,
-      routing_target: "billing-team",
-      summary: "Double charge",
-    };
-    const phase2Output = {
-      response_draft: "[DRAFT] Sorry",
-      internal_note: "Refund needed",
-      next_actions: ["issue_refund"],
-    };
-    const task = makeTask({ phase1Done: true, phase1Output, phase2Retries: 0 });
+    const task = makeTask({
+      phase1Done: true,
+      phase1Output: PHASE1_OUTPUT,
+      phase2Retries: 0,
+    });
+    vi.mocked(getTask)
+      .mockResolvedValueOnce(task as never)
+      .mockResolvedValueOnce(task as never);
+    vi.mocked(runPhase2).mockResolvedValue(PHASE2_OUTPUT);
 
-    (getTask as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce(task)
-      .mockResolvedValueOnce(task);
-
-    (runPhase2 as ReturnType<typeof vi.fn>).mockResolvedValue(phase2Output);
-
-    await processJob("task-123", RECEIPT);
+    await processJob("task-123");
 
     expect(runPhase1).not.toHaveBeenCalled();
     expect(runPhase2).toHaveBeenCalledTimes(1);
@@ -322,40 +309,37 @@ describe("Happy path — both phases succeed", () => {
       expect.objectContaining({ state: "completed" }),
     );
   });
-});
 
-// ════════════════════════════════════════════════════════════════════════════
-describe("Malformed queue messages", () => {
-  it("skips gracefully when task state is already terminal (completed_with_fallback)", async () => {
-    (getTask as ReturnType<typeof vi.fn>).mockResolvedValue(
-      makeTask({ state: "completed_with_fallback" }),
+  it("sets currentPhase to phase_2 when resuming with phase1Done true", async () => {
+    const task = makeTask({
+      phase1Done: true,
+      phase1Output: PHASE1_OUTPUT,
+      phase2Retries: 0,
+    });
+    vi.mocked(getTask)
+      .mockResolvedValueOnce(task as never)
+      .mockResolvedValueOnce(task as never);
+    vi.mocked(runPhase2).mockResolvedValue(PHASE2_OUTPUT);
+
+    await processJob("task-123");
+
+    expect(updateTask).toHaveBeenCalledWith(
+      "task-123",
+      expect.objectContaining({ currentPhase: "phase_2" }),
     );
-
-    await processJob("task-123", RECEIPT);
-
-    expect(runPhase1).not.toHaveBeenCalled();
-    expect(runPhase2).not.toHaveBeenCalled();
-    expect(deleteMessage).toHaveBeenCalledWith(RECEIPT);
   });
 
-  it("skips gracefully when task state is needs_manual_review", async () => {
-    (getTask as ReturnType<typeof vi.fn>).mockResolvedValue(
-      makeTask({ state: "needs_manual_review" }),
+  it("does not fire phase_2_started worker event when task vanishes between phases", async () => {
+    vi.mocked(getTask)
+      .mockResolvedValueOnce(makeTask() as never)
+      .mockResolvedValueOnce(null); // task vanishes after phase 1
+    vi.mocked(runPhase1).mockResolvedValue(PHASE1_OUTPUT);
+
+    await processJob("task-123");
+
+    expect(vi.mocked(workerEvents.emit)).not.toHaveBeenCalledWith(
+      "phase_2_started",
+      expect.anything(),
     );
-
-    await processJob("task-123", RECEIPT);
-
-    expect(runPhase1).not.toHaveBeenCalled();
-    expect(deleteMessage).toHaveBeenCalledWith(RECEIPT);
-  });
-
-  it("skips and deletes message when task record not found in DB", async () => {
-    (getTask as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-
-    await processJob("unknown-task-id", RECEIPT);
-
-    expect(runPhase1).not.toHaveBeenCalled();
-    expect(runPhase2).not.toHaveBeenCalled();
-    expect(deleteMessage).toHaveBeenCalledWith(RECEIPT);
   });
 });
